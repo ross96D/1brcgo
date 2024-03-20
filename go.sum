@@ -1,0 +1,4 @@
+github.com/ross96D/mmap v0.0.1 h1:UtzOjjAJ907HnrYNY4CQ1w3RTKtGvFu0aT0DeHIYC84=
+github.com/ross96D/mmap v0.0.1/go.mod h1:q2S3W734RYoyDkZL9DJvjxq34kKzZTkYPA3nWPt0b+U=
+golang.org/x/sys v0.18.0 h1:DBdB3niSjOA/O0blCZBqDefyWNYveAYMNF1Wum0DYQ4=
+golang.org/x/sys v0.18.0/go.mod h1:/VUhepiaJMQUp4+oa/7Zr1D23ma6VTLIYjOOTFZPUcA=

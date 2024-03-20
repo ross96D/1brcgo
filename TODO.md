@@ -1,0 +1,1 @@
+- Intentar paralelizar la lectura del archivo usando mmap
