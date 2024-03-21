@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"hash/fnv"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,10 +15,83 @@ import (
 
 type CityMetadata struct {
 	Name  string
-	Min   float64
-	Max   float64
-	Sum   float64
-	Count float64
+	Min   int
+	Max   int
+	Sum   int
+	Count int
+}
+
+func (cm CityMetadata) Mean() float64 {
+	return (float64(cm.Sum) / float64(cm.Count)) / 10.0
+}
+
+func (cm CityMetadata) FMin() float64 {
+	return float64(cm.Min) / 10.0
+}
+
+func (cm CityMetadata) FMax() float64 {
+	return float64(cm.Max) / 10.0
+}
+
+type CityMap map[uint64]CityMetadata
+
+func (cm CityMap) Add(name []byte, value int) {
+	hasher := fnv.New64a()
+	hasher.Write(name)
+	cityName := hasher.Sum64()
+	cityData, ok := cm[cityName]
+	if !ok {
+		cityData = CityMetadata{
+			Name:  string(name),
+			Count: 1,
+			Min:   value,
+			Max:   value,
+			Sum:   value,
+		}
+	} else {
+		cityData.Count += 1
+		cityData.Max = max(cityData.Max, value)
+		cityData.Min = min(cityData.Min, value)
+		cityData.Sum += value
+	}
+	cm[cityName] = cityData
+}
+
+func (cm CityMap) Join(other CityMap) {
+	for k, v := range other {
+		cityData, ok := cm[k]
+		if !ok {
+			cityData = v
+		} else {
+			cityData.Count += 1
+			cityData.Max = max(cityData.Max, v.Max)
+			cityData.Min = min(cityData.Min, v.Min)
+			cityData.Sum += v.Sum
+		}
+		cm[k] = cityData
+	}
+}
+
+func (cm CityMap) String() string {
+	builder := strings.Builder{}
+	builder.WriteByte('{')
+	first := false
+	for _, v := range cm {
+		if first {
+			first = false
+		} else {
+			builder.Write([]byte(", "))
+		}
+		builder.WriteString(v.Name)
+		builder.WriteByte('=')
+		builder.WriteString(strconv.FormatFloat(v.FMin(), 'f', 1, 64))
+		builder.WriteByte('/')
+		builder.WriteString(strconv.FormatFloat(v.Mean(), 'f', 1, 64))
+		builder.WriteByte('/')
+		builder.WriteString(strconv.FormatFloat(v.FMax(), 'f', 1, 64))
+	}
+	builder.WriteByte('}')
+	return builder.String()
 }
 
 const filename = "../measurements.txt"
@@ -24,18 +100,18 @@ func main() {
 	start := time.Now()
 
 	wg := sync.WaitGroup{}
-	channel := make(chan int64)
-	var sum int64 = 0
+	channel := make(chan CityMap)
+	result := make(CityMap)
 	done := make(chan (bool), 1)
 
 	go func() {
 		for s := range channel {
-			sum += s
+			result.Join(s)
 		}
 		done <- true
 	}()
 
-	var threads = runtime.NumCPU()
+	var threads = runtime.NumCPU() * 2
 	file, err := mmap.Open(filename)
 	if err != nil {
 		panic(err)
@@ -60,13 +136,13 @@ func main() {
 
 	<-done
 	close(done)
-	println(sum)
+	println(result.String())
 	println("Time", time.Since(start).String())
 
 }
 
-func read(start int64, end int64, file *mmap.File, channel chan int64) {
-	var cityMap = map[uint64]CityMetadata{}
+func read(start int64, end int64, file *mmap.File, channel chan CityMap) {
+	var cityMap = make(CityMap)
 
 	if end-start <= 0 {
 		return
@@ -75,113 +151,78 @@ func read(start int64, end int64, file *mmap.File, channel chan int64) {
 		panic("distribution is wrong")
 	}
 
-	var cum int64 = 0
-	var lines int64 = 0
 	const length int64 = 4098
 	buff := [length]byte{}
 	offset := start
 	var bToRead int64
+
+	type State uint
+	const (
+		Name State = iota
+		ValueLeft
+		ValueRigth
+		EndParsing
+	)
+
 	for offset < end {
 		// read bytes from file
-		// TODO this is eating one line because when it reads the first time the second read does not start after a new line
 		if length+offset > end {
 			bToRead = end - offset
 		} else {
 			bToRead = length
 		}
-		n, err := file.ReadAt(buff[:bToRead], offset)
+		_, err := file.ReadAt(buff[:bToRead], offset)
 		if err != nil {
 			panic(err)
 		}
-		offset += bToRead
-		cum += int64(n)
 
-		start := 0
+		var cityName []byte
+		var cityValue int = 0
+		var newLine int = 0
+		var isNegative = false
+		var state State = Name
+
 		for i := 0; i < int(bToRead); i++ {
-			if start != 0 && buff[start-1] != '\n' {
-				panic("WTF")
-			}
-			if buff[i] == '\n' {
-				var before byte = 2
-				if start != 0 {
-					before = buff[start-1]
+			switch state {
+			case Name:
+				if buff[i] == ';' {
+					state = ValueLeft
+					cityName = buff[newLine:i]
+					if i+1 < int(bToRead) && buff[i+1] == '-' {
+						isNegative = true
+						i += 1
+					}
 				}
-				parseLine(cityMap, buff[start:i], buff[i], before)
-				start = i + 1
+			case ValueLeft:
+				if buff[i] == '.' {
+					state = ValueRigth
+				} else {
+					cityValue = cityValue*10 + int(buff[i]-'0')
+				}
+			case ValueRigth:
+				if buff[i] == '\n' {
+					state = EndParsing
+					if isNegative {
+						cityValue *= -1
+					}
+					if bytes.IndexByte(cityName, '\n') != -1 {
+						panic(string(cityName))
+					}
+					cityMap.Add(cityName, cityValue)
+					newLine = i + 1
+				} else {
+					cityValue = cityValue*10 + int(buff[i]-'0')
+				}
+			case EndParsing:
+				cityValue = 0
+				isNegative = false
+				state = Name
+				i--
 			}
 		}
+		offset += int64(newLine)
 	}
-	channel <- lines
-}
-
-func parseLine(cityMap map[uint64]CityMetadata, line []byte, last byte, before byte) {
-	if last != '\n' {
-		panic("Z")
-	}
-	sep := 0
-	for i, b := range line {
-		if b == ';' {
-			sep = i
-			break
-		}
-	}
-	if sep == 0 {
-		return
-		panic(fmt.Sprintf("could not parse line %s  %d", string(line), before))
-	}
-
-	hasher := fnv.New64a()
-	hasher.Write(line[:sep-1])
-
-	cityName := hasher.Sum64()
-	// println(cityName, string(line[sep+1:]))
-	val := parseFloat(line[sep+1:])
-	// if err != nil {
-	// 	fmt.Println(string(string(line[sep+1:])))
-	// 	panic(err)
-	// }
-	cityData, ok := cityMap[cityName]
-	if !ok {
-		cityData = CityMetadata{
-			Name:  string(string(line[:sep-1])),
-			Min:   val,
-			Max:   val,
-			Sum:   val,
-			Count: 1,
-		}
-	} else {
-		cityData.Count += 1
-		cityData.Sum += val
-		if cityData.Max < val {
-			cityData.Max = val
-		} else if cityData.Min > val {
-			cityData.Min = val
-		}
-	}
-	cityMap[cityName] = cityData
-}
-
-func parseFloat(b []byte) float64 {
-	var result float64
-	isNegative := false
-	if b[0] == '-' {
-		isNegative = true
-		b = b[1:]
-	}
-	switch len(b) {
-	case 1, 2:
-		result = float64(b[0])
-	case 3:
-		result = float64(b[0]) + float64(b[2])*0.1
-	case 4:
-		result = float64(b[0]*10+b[1]) + float64(b[3])*0.1
-	default:
-		panic(fmt.Sprintf("SSSSSSSSSSSSSS %s", string(b)))
-	}
-	if isNegative {
-		result *= -1
-	}
-	return result
+	channel <- cityMap
 }
 
 func makeDistribution(file *mmap.File, threads int) ([]int64, error) {
@@ -189,15 +230,15 @@ func makeDistribution(file *mmap.File, threads int) ([]int64, error) {
 		return nil, fmt.Errorf("invalid value of threads")
 	}
 
-	if threads == 1 {
-		panic("TODO")
-	}
-
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
 	}
 	size := info.Size()
+	if threads == 1 {
+		return []int64{0, size}, nil
+	}
+
 	distribution := make([]int64, threads+1)
 
 	var limit int64 = size / int64(threads)
