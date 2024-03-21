@@ -18,18 +18,15 @@ func main() {
 	var sum int64 = 0
 	done := make(chan (bool), 1)
 
-	// Read all incoming words from the channel and add them to the dictionary.
 	go func() {
 		for s := range channel {
 			sum += s
 		}
-		// Signal the main thread that all the words have entered the dictionary.
 		done <- true
 	}()
 
-	// Current signifies the counter for bytes of the file.
 	var current int64 = 0
-	const threads = 10
+	const threads = 16
 	file, err := mmap.Open(filename)
 	if err != nil {
 		panic(err)
@@ -39,26 +36,28 @@ func main() {
 		panic(err)
 	}
 
-	// Limit signifies the chunk size of file to be proccessed by every thread.
 	var limit int64 = info.Size() / threads
-	for i := 0; i < 10; i++ {
+	for i := 0; i < threads; i++ {
 		wg.Add(1)
 
-		go func(current int64) {
-			read(current, limit, file, channel)
+		go func(current int64, i int) {
+			var final int64
+			if i == threads-1 {
+				final = info.Size()
+			} else {
+				final = current + limit
+			}
+			read(current, final, file, channel)
 			fmt.Printf("%d thread has been completed\n", i)
 			wg.Done()
-		}(current)
+		}(current, i)
 
-		// Increment the current by 1+(last byte read by previous thread).
 		current += limit
 	}
 
-	// Wait for all go routines to complete.
 	wg.Wait()
 	close(channel)
 
-	// Wait for dictionary to process all the words.
 	<-done
 	close(done)
 	println(sum)
@@ -66,30 +65,34 @@ func main() {
 
 }
 
-// [start:end)
-func read(start int64, range_read int64, file *mmap.File, channel chan int64) {
-	// file, err := os.Open(fileName)
-	// if err != nil {
-	// panic(err)
-	// }
-	// defer file.Close()
-	// file.ReadAt()
-
-	// file.ReadAt(start, 0)
-	// Move the pointer of the file to the start of designated chunk.
-	if range_read <= 0 {
+func read(start int64, end int64, file *mmap.File, channel chan int64) {
+	if end-start <= 0 {
 		return
 	}
 	var cum int64 = 0
-	const length = 4098
+	var lines int64 = 0
+	const length int64 = 4098
 	buff := [length]byte{}
-
-	for cum < range_read {
-		n, err := file.Read(buff[:])
-		if err != nil {
-			break
+	offset := start
+	var bToRead int64
+	for offset < end {
+		if length+offset > end {
+			bToRead = end - offset
+		} else {
+			bToRead = length
 		}
+		n, err := file.ReadAt(buff[:bToRead], offset)
+		if err != nil {
+			panic(err)
+		}
+		offset += bToRead
 		cum += int64(n)
+
+		for i := 0; i < int(bToRead); i++ {
+			if buff[i] == '\n' {
+				lines++
+			}
+		}
 	}
-	channel <- range_read
+	channel <- lines
 }
