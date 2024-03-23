@@ -1,10 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"hash/fnv"
+	"os"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,12 +14,24 @@ import (
 	"github.com/ross96D/mmap"
 )
 
+const bufferLength int64 = 4098
+
 type CityMetadata struct {
 	Name  string
 	Min   int
 	Max   int
 	Sum   int
 	Count int
+}
+
+func NewCityMetadata(name string, val int) *CityMetadata {
+	return &CityMetadata{
+		Name:  name,
+		Min:   val,
+		Max:   val,
+		Sum:   val,
+		Count: 1,
+	}
 }
 
 func (cm CityMetadata) Mean() float64 {
@@ -33,7 +46,7 @@ func (cm CityMetadata) FMax() float64 {
 	return float64(cm.Max) / 10.0
 }
 
-type CityMap map[uint64]CityMetadata
+type CityMap map[uint64]*CityMetadata
 
 func (cm CityMap) Add(name []byte, value int) {
 	hasher := fnv.New64a()
@@ -41,20 +54,13 @@ func (cm CityMap) Add(name []byte, value int) {
 	cityName := hasher.Sum64()
 	cityData, ok := cm[cityName]
 	if !ok {
-		cityData = CityMetadata{
-			Name:  string(name),
-			Count: 1,
-			Min:   value,
-			Max:   value,
-			Sum:   value,
-		}
+		cm[cityName] = NewCityMetadata(string(name), value)
 	} else {
-		cityData.Count += 1
+		cityData.Count = cityData.Count + 1
 		cityData.Max = max(cityData.Max, value)
 		cityData.Min = min(cityData.Min, value)
-		cityData.Sum += value
+		cityData.Sum = cityData.Sum + value
 	}
-	cm[cityName] = cityData
 }
 
 func (cm CityMap) Join(other CityMap) {
@@ -97,6 +103,17 @@ func (cm CityMap) String() string {
 const filename = "../measurements.txt"
 
 func main() {
+	f, err := os.Create("cpu_profile.prof")
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+
+	if err := pprof.StartCPUProfile(f); err != nil {
+		panic(err)
+	}
+	defer pprof.StopCPUProfile()
+
 	start := time.Now()
 
 	wg := sync.WaitGroup{}
@@ -111,7 +128,7 @@ func main() {
 		done <- true
 	}()
 
-	var threads = runtime.NumCPU() * 2
+	var threads = runtime.NumCPU()
 	file, err := mmap.Open(filename)
 	if err != nil {
 		panic(err)
@@ -137,12 +154,13 @@ func main() {
 	<-done
 	close(done)
 	println(result.String())
+	println(len(result))
 	println("Time", time.Since(start).String())
 
 }
 
 func read(start int64, end int64, file *mmap.File, channel chan CityMap) {
-	var cityMap = make(CityMap)
+	var cityMap = make(CityMap, 4098)
 
 	if end-start <= 0 {
 		return
@@ -151,78 +169,107 @@ func read(start int64, end int64, file *mmap.File, channel chan CityMap) {
 		panic("distribution is wrong")
 	}
 
-	const length int64 = 4098
-	buff := [length]byte{}
+	buff := [bufferLength]byte{}
 	offset := start
 	var bToRead int64
 
-	type State uint
-	const (
-		Name State = iota
-		ValueLeft
-		ValueRigth
-		EndParsing
-	)
-
 	for offset < end {
 		// read bytes from file
-		if length+offset > end {
+		if bufferLength+offset > end {
 			bToRead = end - offset
 		} else {
-			bToRead = length
+			bToRead = bufferLength
 		}
 		_, err := file.ReadAt(buff[:bToRead], offset)
 		if err != nil {
 			panic(err)
 		}
 
-		var cityName []byte
-		var cityValue int = 0
-		var newLine int = 0
-		var isNegative = false
-		var state State = Name
-
-		for i := 0; i < int(bToRead); i++ {
-			switch state {
-			case Name:
-				if buff[i] == ';' {
-					state = ValueLeft
-					cityName = buff[newLine:i]
-					if i+1 < int(bToRead) && buff[i+1] == '-' {
-						isNegative = true
-						i += 1
-					}
-				}
-			case ValueLeft:
-				if buff[i] == '.' {
-					state = ValueRigth
-				} else {
-					cityValue = cityValue*10 + int(buff[i]-'0')
-				}
-			case ValueRigth:
-				if buff[i] == '\n' {
-					state = EndParsing
-					if isNegative {
-						cityValue *= -1
-					}
-					if bytes.IndexByte(cityName, '\n') != -1 {
-						panic(string(cityName))
-					}
-					cityMap.Add(cityName, cityValue)
-					newLine = i + 1
-				} else {
-					cityValue = cityValue*10 + int(buff[i]-'0')
-				}
-			case EndParsing:
-				cityValue = 0
-				isNegative = false
-				state = Name
-				i--
-			}
-		}
-		offset += int64(newLine)
+		offset += readBuffer(cityMap, buff[:], bToRead)
 	}
 	channel <- cityMap
+}
+
+type State uint
+
+const (
+	Name State = iota
+	ValueLeft
+	ValueRigth
+	EndParsing
+)
+
+func readBuffer(cityMap CityMap, buffer []byte, bToRead int64) int64 {
+	var cityName []byte
+	var newLine int
+	var ok bool
+	var i int
+	var cityValue int
+
+	for {
+		i, cityName, cityValue, ok = readLine(buffer, newLine, i, bToRead)
+		if !ok {
+			break
+		}
+		cityMap.Add(cityName, cityValue)
+		newLine = i + 1
+	}
+	return int64(newLine)
+}
+
+func parseName(buffer []byte, start int, i int, bToRead int64) (int, []byte, bool) {
+	var cityName []byte
+	var ok bool = false
+	for ; i < int(bToRead); i++ {
+		if buffer[i] == ';' {
+			ok = true
+			cityName = buffer[start:i]
+			break
+		}
+	}
+	i++
+	return i, cityName, ok
+}
+
+func parseFloat(buffer []byte, i int, bToRead int64) (int, int, bool) {
+	var cityValue int = 0
+	var ok bool = false
+	for ; i < int(bToRead); i++ {
+		if buffer[i] == '.' {
+			continue
+		}
+		if buffer[i] == '\n' {
+			ok = true
+			break
+		}
+		cityValue = cityValue*10 + int(buffer[i]-'0')
+	}
+	return i, cityValue, ok
+}
+
+func readLine(buffer []byte, start int, i int, bToRead int64) (int, []byte, int, bool) {
+	var cityName []byte
+	var isNegative = 1
+	var ok bool
+
+	i, cityName, ok = parseName(buffer, start, i, bToRead)
+	if !ok {
+		return i, nil, 0, false
+	}
+	if i >= int(bToRead) {
+		return i, nil, 0, false
+	}
+	if buffer[i] == '-' {
+		isNegative = -1
+	}
+
+	i, cityValue, ok := parseFloat(buffer, i, bToRead)
+	if !ok {
+		return i, nil, 0, false
+	}
+	cityValue = isNegative * cityValue
+
+	return i, cityName, cityValue, true
 }
 
 func makeDistribution(file *mmap.File, threads int) ([]int64, error) {
